@@ -486,6 +486,104 @@ impl<I2c: embedded_hal_async::i2c::I2c, Delay: embedded_hal_async::delay::DelayN
             .vbatdeltim())
     }
 
+    pub async fn get_full_scale_current(&mut self) -> Result<f32, crate::NPM1300Error<I2c::Error>> {
+        // Get charger mode
+        let charger_mode = self
+            .device
+            .adc()
+            .adcibatmeasstatus()
+            .read_async()
+            .await?
+            .bchargermode();
+        // Calculate full scale current based on charger mode
+        let full_scale_current = if charger_mode == 1 {
+            let discharge_current_msb = self
+                .device
+                .charger()
+                .bchgisetdischargemsb()
+                .read_async()
+                .await?
+                .bchgisetdischargemsb();
+            let discharge_current_lsb = self
+                .device
+                .charger()
+                .bchgisetdischargelsb()
+                .read_async()
+                .await?
+                .bchgisetdischargelsb();
+            let discharge_current =
+                (discharge_current_msb as u16) << 2 | (discharge_current_lsb & 0x03) as u16;
+            #[cfg(feature = "defmt-03")]
+            defmt::debug!("Battery is discharging");
+            discharge_current as f32 * 0.836
+        } else if charger_mode == 3 {
+            let charge_current_msb = self
+                .device
+                .charger()
+                .bchgisetmsb()
+                .read_async()
+                .await?
+                .bchgisetchargemsb();
+            let charge_current_lsb = self
+                .device
+                .charger()
+                .bchgisetlsb()
+                .read_async()
+                .await?
+                .bchgisetchargelsb();
+            let charge_current =
+                (charge_current_msb as u16) << 2 | (charge_current_lsb & 0x03) as u16;
+            #[cfg(feature = "defmt-03")]
+            defmt::debug!("Battery is charging");
+
+            charge_current as f32 * 1.25
+        } else {
+            unreachable!();
+        };
+        #[cfg(feature = "defmt-03")]
+        defmt::debug!("Full scale current: {full_scale_current}");
+
+        #[cfg(feature = "defmt-03")]
+        defmt::debug!("Triggering IBAT measurement...");
+        self.device
+            .adc()
+            .taskibatmeasure()
+            .dispatch_async(|command| command.set_taskibatmeasure(crate::common::Task::Trigger))
+            .await?;
+
+        // Wait for measurement to complete
+        #[cfg(feature = "defmt-03")]
+        defmt::debug!("Waiting for measurement to complete...");
+        self.delay.delay_us(250).await;
+
+        // Get current measurement
+        let msb = self
+            .device
+            .adc()
+            .adcvbatburstresultmsb(2)
+            .read_async()
+            .await?
+            .vbatresultmsb();
+        let lsb = self
+            .device
+            .adc()
+            .adcgp_1_resultlsbs()
+            .read_async()
+            .await?
+            .vbat_2_resultlsb();
+        let current = ((msb as u16) << 2) | (lsb & 0x03) as u16;
+        #[cfg(feature = "defmt-03")]
+        defmt::debug!("MSB: {}, LSB: {}", msb, lsb);
+        #[cfg(feature = "defmt-03")]
+        defmt::debug!("Combined MSB and LSB: {}", current);
+
+        // Calculate full scale voltage
+        let result = (current as f32 / 1023.0) * full_scale_current;
+        #[cfg(feature = "defmt-03")]
+        defmt::debug!("Computed current: {}", result);
+        Ok(result)
+    }
+
     /// Configure auto VBAT measurement
     ///
     /// # Arguments
