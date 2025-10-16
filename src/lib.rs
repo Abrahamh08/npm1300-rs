@@ -9,6 +9,7 @@ pub mod buck;
 pub mod charger;
 pub mod gpios;
 pub mod leds;
+pub mod mainreg;
 pub mod pof;
 pub mod ship;
 pub mod sysreg;
