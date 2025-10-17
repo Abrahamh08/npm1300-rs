@@ -487,6 +487,14 @@ impl<I2c: embedded_hal_async::i2c::I2c, Delay: embedded_hal_async::delay::DelayN
     }
 
     pub async fn get_full_scale_current(&mut self) -> Result<f32, crate::NPM1300Error<I2c::Error>> {
+        #[cfg(feature = "defmt-03")]
+        defmt::debug!("Triggering IBAT measurement...");
+        self.device
+            .adc()
+            .taskibatmeasure()
+            .dispatch_async(|command| command.set_taskibatmeasure(Task::Trigger))
+            .await?;
+
         // Get charger mode
         let charger_mode = self
             .device
