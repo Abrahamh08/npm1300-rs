@@ -486,92 +486,31 @@ impl<I2c: embedded_hal_async::i2c::I2c, Delay: embedded_hal_async::delay::DelayN
             .vbatdeltim())
     }
 
-    pub async fn get_full_scale_current(&mut self) -> Result<f32, crate::NPM1300Error<I2c::Error>> {
-        #[cfg(feature = "defmt-03")]
-        defmt::debug!("Triggering IBAT measurement...");
+    /// Calculate battery current in microamps (µA)
+    pub async fn calculate_ibat(&mut self) -> Result<i32, crate::NPM1300Error<I2c::Error>> {
         self.device
             .adc()
-            .taskibatmeasure()
-            .dispatch_async(|command| command.set_taskibatmeasure(Task::Trigger))
+            .taskvbatmeasure()
+            .dispatch_async(|w| w.set_taskvbatmeasure(crate::adc::Task::Trigger))
             .await?;
 
-        // Get charger mode
-        let charger_mode = self
-            .device
-            .adc()
-            .adcibatmeasstatus()
-            .read_async()
-            .await?
-            .bchargermode();
-        // Calculate full scale current based on charger mode
-        let full_scale_current = if charger_mode == 1 {
-            let discharge_current_msb = self
-                .device
-                .charger()
-                .bchgisetdischargemsb()
-                .read_async()
-                .await?
-                .bchgisetdischargemsb();
-            let discharge_current_lsb = self
-                .device
-                .charger()
-                .bchgisetdischargelsb()
-                .read_async()
-                .await?
-                .bchgisetdischargelsb();
-            let discharge_current =
-                (discharge_current_msb as u16) << 2 | (discharge_current_lsb & 0x03) as u16;
-            #[cfg(feature = "defmt-03")]
-            defmt::debug!("Battery is discharging");
-            discharge_current as f32 * 0.836
-        } else if charger_mode == 3 {
-            let charge_current_msb = self
-                .device
-                .charger()
-                .bchgisetmsb()
-                .read_async()
-                .await?
-                .bchgisetchargemsb();
-            let charge_current_lsb = self
-                .device
-                .charger()
-                .bchgisetlsb()
-                .read_async()
-                .await?
-                .bchgisetchargelsb();
-            let charge_current =
-                (charge_current_msb as u16) << 2 | (charge_current_lsb & 0x03) as u16;
-            #[cfg(feature = "defmt-03")]
-            defmt::debug!("Battery is charging");
+        self.delay.delay_us(200).await;
 
-            charge_current as f32 * 1.25
-        } else {
-            unreachable!();
-        };
-        #[cfg(feature = "defmt-03")]
-        defmt::debug!("Full scale current: {full_scale_current}");
+        let st = self.device.adc().adcibatmeasstatus().read_async().await?;
+        let mode = st.bchargermode();
+        let invalid = st.batmeaseinvalid() == 1;
+        if invalid {
+            return Ok(0);
+        }
 
-        #[cfg(feature = "defmt-03")]
-        defmt::debug!("Triggering IBAT measurement...");
-        self.device
-            .adc()
-            .taskibatmeasure()
-            .dispatch_async(|command| command.set_taskibatmeasure(crate::common::Task::Trigger))
-            .await?;
-
-        // Wait for measurement to complete
-        #[cfg(feature = "defmt-03")]
-        defmt::debug!("Waiting for measurement to complete...");
-        self.delay.delay_us(250).await;
-
-        // Get current measurement
         let msb = self
             .device
             .adc()
-            .adcvbatburstresultmsb(2)
+            .adcvbatburstresultmsb(2) 
             .read_async()
             .await?
             .vbatresultmsb();
+
         let lsb = self
             .device
             .adc()
@@ -579,17 +518,33 @@ impl<I2c: embedded_hal_async::i2c::I2c, Delay: embedded_hal_async::delay::DelayN
             .read_async()
             .await?
             .vbat_2_resultlsb();
-        let current = ((msb as u16) << 2) | (lsb & 0x03) as u16;
-        #[cfg(feature = "defmt-03")]
-        defmt::debug!("MSB: {}, LSB: {}", msb, lsb);
-        #[cfg(feature = "defmt-03")]
-        defmt::debug!("Combined MSB and LSB: {}", current);
 
-        // Calculate full scale voltage
-        let result = (current as f32 / 1023.0) * full_scale_current;
-        #[cfg(feature = "defmt-03")]
-        defmt::debug!("Computed current: {}", result);
-        Ok(result)
+        let code: u16 = ((msb as u16) << 2) | ((lsb & 0x03) as u16); // 0..1023
+
+        let decode_ma = |msb: u8, lsb: u8| -> u16 {
+            (4 * (msb as u16)) + (2 * ((lsb as u16) & 0x01))
+        };
+
+        let (full_scale_ua, sign): (i32, i32) = match mode {
+            3 => {
+                // Charging -> negative
+                let cmsb = self.device.charger().bchgisetmsb().read_async().await?.bchgisetchargemsb();
+                let clsb = self.device.charger().bchgisetlsb().read_async().await?.bchgisetchargelsb();
+                let ichg_ma = decode_ma(cmsb, clsb) as i32;
+                (ichg_ma * 1250, -1)
+            }
+            1 | 2 => {
+                // Discharging path -> positive
+                let dmsb = self.device.charger().bchgisetdischargemsb().read_async().await?.bchgisetdischargemsb();
+                let dlsb = self.device.charger().bchgisetdischargelsb().read_async().await?.bchgisetdischargelsb();
+                let idis_ma = decode_ma(dmsb, dlsb) as i32;
+                (idis_ma * 112, 1)
+            }
+            _ => return Ok(0),
+        };
+
+        let ibat_ua = (full_scale_ua as i64 * code as i64) / 1023;
+        Ok((sign as i64 * ibat_ua) as i32)
     }
 
     /// Configure auto VBAT measurement
@@ -609,6 +564,28 @@ impl<I2c: embedded_hal_async::i2c::I2c, Delay: embedded_hal_async::delay::DelayN
                     Vbatautoenable::Autoenable
                 } else {
                     Vbatautoenable::Noauto
+                })
+            })
+            .await
+    }
+
+    /// Configure auto IBAT measurement after VBAT
+    ///
+    /// # Arguments
+    ///
+    /// * `enable` - If true, enable auto IBAT measurement after VBAT measurement
+    pub async fn configure_auto_ibat_measurement(
+        &mut self,
+        enable: bool,
+    ) -> Result<(), crate::NPM1300Error<I2c::Error>> {
+        self.device
+            .adc()
+            .adcibatmeasen()
+            .modify_async(|reg| {
+                reg.set_ibatmeasenable(if enable {
+                    1
+                } else {
+                    0
                 })
             })
             .await
